@@ -448,7 +448,6 @@ static void draw() {
     hint("m", "move");
     hint("N", "+col");
     hint("X", "-col");
-    hint("[/]", "scroll");
     hint("q", "quit");
     std::fputs(RESET, stdout);
 
