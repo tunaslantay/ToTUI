@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -408,7 +409,7 @@ static void draw() {
     clamp_view();
     int vc  = vis_count();
     int cw  = vc > 0 ? T_COLS / vc : T_COLS;
-    int col_hdr = 4;
+    int col_hdr = 5;
     int crows   = T_ROWS - col_hdr - 2 - 1 - 2;
     if (crows < 1) crows = 1;
 
@@ -420,8 +421,7 @@ static void draw() {
     MOVE(1, 1);
     std::printf("%s%s%s", C_TITLE_BG, C_TITLE_FG, BOLD);
     char tb[256];
-    std::snprintf(tb, sizeof(tb),
-        "  ✦ todo  ");
+    std::snprintf(tb, sizeof(tb), "  ✦ todo  ");
     std::fputs(tb, stdout);
     // section breadcrumb
     std::printf("%s  %d section%s  ", DIM, nsec(), nsec() == 1 ? "" : "s");
@@ -433,21 +433,30 @@ static void draw() {
     MOVE(1, sz_col);
     std::printf("%s%s%s%s", C_TITLE_BG, DIM, sz, RESET);
 
-    // ── hint bar ──
+    // ── hint bar row 1 ──
     MOVE(2, 1);
     std::printf("%s  ", C_HINT_FG);
     auto hint = [](const char* key, const char* label) {
         std::printf("%s%s%s%s %s  ", BOLD, C_HINT_KEY_FG, key, C_HINT_FG, label);
     };
-    hint("↑↓", "nav");
-    hint("←→", "col");
+    hint("↑↓/jk", "nav");
+    hint("←→/hl", "col");
     hint("a", "add");
+    hint("e", "edit");
     hint("d", "del");
     hint("spc", "done");
     hint("p", "pri");
     hint("m", "move");
-    hint("N", "+col");
-    hint("X", "-col");
+    std::fputs(RESET, stdout);
+
+    // ── hint bar row 2 ──
+    MOVE(3, 1);
+    std::printf("%s  ", C_HINT_FG);
+    hint("J/K", "reorder");
+    hint("N", "new col");
+    hint("R", "ren col");
+    hint("X", "del col");
+    hint("[]", "scroll");
     hint("q", "quit");
     std::fputs(RESET, stdout);
 
@@ -478,37 +487,53 @@ static void draw() {
 
 // ── input helpers ─────────────────────────────────────────────────────
 // Read a line using raw read() so it works reliably across repeated calls.
-// Enables canonical mode + echo just for the duration of the prompt.
-static std::string prompt_line(const char* msg) {
-    // Switch to canonical mode with echo so the user gets normal line editing
-    termios cooked = orig_term;
-    cooked.c_lflag |= (ICANON | ECHO);
-    cooked.c_cc[VMIN]  = 1;
-    cooked.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked);
+static std::optional<std::string> prompt_line(const char* msg, std::string line = "") {
     SHOW_CUR;
-
-    std::fputs(msg, stdout); std::fflush(stdout);
-
-    std::string line;
-    char c;
     while (true) {
-        ssize_t n = ::read(STDIN_FILENO, &c, 1);
-        if (n <= 0 || c == '\n') break;
-        if (c == '\r') break;
-        // handle backspace
-        if (c == 127 || c == '\b') {
-            if (!line.empty()) {
-                line.pop_back();
-                std::fputs("\b \b", stdout); std::fflush(stdout);
-            }
-            continue;
-        }
-        line += c;
-    }
+        std::fputs("\r\033[K", stdout);
+        std::fputs(msg, stdout);
+        std::fputs(line.c_str(), stdout);
+        std::fflush(stdout);
 
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, nullptr) <= 0) break;
+
+        char c;
+        if (::read(STDIN_FILENO, &c, 1) != 1) break;
+
+        if (c == '\n' || c == '\r') {
+            std::fputs("\n", stdout);
+            break;
+        }
+        if (c == 27) { // ESC
+            timeval tv { 0, 50'000 };
+            fd_set fds2; FD_ZERO(&fds2); FD_SET(STDIN_FILENO, &fds2);
+            if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv) > 0) {
+                char seq[2];
+                if (::read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[') {
+                    if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv) > 0) {
+                        ::read(STDIN_FILENO, &seq[1], 1);
+                    }
+                }
+            } else {
+                HIDE_CUR;
+                return std::nullopt; // Cancelled
+            }
+        } else if (c == 127 || c == '\b') {
+            if (!line.empty()) {
+                while (!line.empty()) {
+                    unsigned char uc = line.back();
+                    line.pop_back();
+                    if ((uc & 0xC0) != 0x80) break;
+                }
+            }
+        } else if (static_cast<unsigned char>(c) >= 32) {
+            line += c;
+        }
+    }
     HIDE_CUR;
-    raw_on();   // restore raw + non-blocking mode
     return line;
 }
 
@@ -547,7 +572,6 @@ static void act_add_task() {
     Section& S = sections[static_cast<size_t>(active)];
     if (static_cast<int>(S.tasks.size()) >= MAX_TASKS) return;
 
-    // draw the header in raw mode, then prompt_line will switch to cooked
     std::fputs(CLEAR, stdout);
     std::printf(C_TITLE_BG C_TITLE_FG BOLD "  ✓ ADD TASK to \"%s\"", S.name.c_str());
     int pad = T_COLS - 20 - static_cast<int>(S.name.size());
@@ -555,13 +579,67 @@ static void act_add_task() {
     std::fputs(RESET "\n\n", stdout);
     std::fflush(stdout);
 
-    std::string text = prompt_line("  Task: ");
-    if (text.empty()) return;
+    auto text = prompt_line("  Task: ");
+    if (!text || text->empty()) return;
 
     int pri = prompt_int("  Priority (1=High 2=Medium 3=Low) [2]: ", 1, 3, 2);
-    S.tasks.push_back({ text, false, pri });
+    S.tasks.push_back({ *text, false, pri });
     S.cursor = static_cast<int>(S.tasks.size()) - 1;
     save();
+}
+
+static void act_edit_task() {
+    if (sections.empty()) return;
+    Section& S = sections[static_cast<size_t>(active)];
+    if (S.tasks.empty()) return;
+    Task& t = S.tasks[static_cast<size_t>(S.cursor)];
+
+    std::fputs(CLEAR, stdout);
+    std::printf(C_TITLE_BG C_TITLE_FG BOLD "  ✎ EDIT TASK in \"%s\"", S.name.c_str());
+    int pad = T_COLS - 21 - static_cast<int>(S.name.size());
+    for (int i = 0; i < pad; i++) std::putchar(' ');
+    std::fputs(RESET "\n\n", stdout);
+    std::fflush(stdout);
+
+    auto text = prompt_line("  Task: ", t.text);
+    if (text && !text->empty()) {
+        t.text = *text;
+        save();
+    }
+}
+
+static void act_rename_section() {
+    if (sections.empty()) return;
+    Section& S = sections[static_cast<size_t>(active)];
+
+    std::fputs(CLEAR C_TITLE_BG C_TITLE_FG BOLD "  ✎ RENAME SECTION" RESET "\n\n", stdout);
+    std::fflush(stdout);
+
+    auto name = prompt_line("  Section name: ", S.name);
+    if (name && !name->empty()) {
+        S.name = *name;
+        save();
+    }
+}
+
+static void act_move_up() {
+    if (sections.empty()) return;
+    Section& S = sections[static_cast<size_t>(active)];
+    if (S.cursor > 0) {
+        std::swap(S.tasks[S.cursor], S.tasks[S.cursor - 1]);
+        S.cursor--;
+        save();
+    }
+}
+
+static void act_move_down() {
+    if (sections.empty()) return;
+    Section& S = sections[static_cast<size_t>(active)];
+    if (S.cursor < static_cast<int>(S.tasks.size()) - 1) {
+        std::swap(S.tasks[S.cursor], S.tasks[S.cursor + 1]);
+        S.cursor++;
+        save();
+    }
 }
 
 static void act_del_task() {
@@ -623,9 +701,9 @@ static void act_add_section() {
     if (nsec() >= MAX_SECTIONS) return;
     std::fputs(CLEAR C_TITLE_BG C_TITLE_FG BOLD "  ✓ NEW SECTION" RESET "\n\n", stdout);
     std::fflush(stdout);
-    std::string name = prompt_line("  Section name: ");
-    if (name.empty()) return;
-    sections.emplace_back(name);
+    auto name = prompt_line("  Section name: ");
+    if (!name || name->empty()) return;
+    sections.emplace_back(*name);
     active   = nsec() - 1;
     view_off = std::max(0, nsec() - MAX_VIS);
     save();
@@ -680,11 +758,19 @@ int main() {
             }
         }
         else if (ch == 'a' || ch == 'A') { act_add_task();    dirty = true; }
+        else if (ch == 'e' || ch == 'E') { act_edit_task();   dirty = true; }
         else if (ch == 'd' || ch == 'D') { act_del_task();    dirty = true; }
         else if (ch == ' ')              { act_toggle();       dirty = true; }
         else if (ch == 'p' || ch == 'P') { act_priority();    dirty = true; }
         else if (ch == 'm' || ch == 'M') { act_move();        dirty = true; }
+        else if (ch == 'J')              { act_move_down();   dirty = true; }
+        else if (ch == 'K')              { act_move_up();     dirty = true; }
+        else if (ch == 'k') { Section* S = !sections.empty() ? &sections[static_cast<size_t>(active)] : nullptr; if (S && S->cursor > 0) { S->cursor--; dirty = true; } }
+        else if (ch == 'j') { Section* S = !sections.empty() ? &sections[static_cast<size_t>(active)] : nullptr; if (S && S->cursor < (int)S->tasks.size()-1) { S->cursor++; dirty = true; } }
+        else if (ch == 'h') { if (active > 0) { active--; clamp_view(); dirty = true; } }
+        else if (ch == 'l') { if (active < nsec()-1) { active++; clamp_view(); dirty = true; } }
         else if (ch == 'N')              { act_add_section();  dirty = true; }
+        else if (ch == 'R')              { act_rename_section(); dirty = true;}
         else if (ch == 'X')              { act_rem_section();  dirty = true; }
         else if (ch == '[') { if (view_off > 0)                { view_off--; dirty = true; } }
         else if (ch == ']') { if (view_off + MAX_VIS < nsec()) { view_off++; dirty = true; } }
